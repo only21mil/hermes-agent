@@ -865,6 +865,25 @@ class TestFindAliasForProfile:
         (wrapper_dir / "pip").write_text("#!/bin/sh\nexec python -m pip \"$@\"\n")
         assert find_alias_for_profile("steve") is None
 
+    def test_skips_files_larger_than_cap(self, profile_env, monkeypatch):
+        # Regression: ~/.local/bin can hold large suffix-less binaries
+        # (swiftlint, qdrant, uv, …). find_alias_for_profile() runs once per
+        # profile, so reading + UTF-8-decoding multi-MB files pegs the event
+        # loop and wedges the dashboard backend. Files too large to be one of
+        # our ~40-byte wrappers must be skipped BEFORE being read — even if
+        # their bytes happen to contain the needle.
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import (
+            _get_wrapper_dir,
+            find_alias_for_profile,
+            _MAX_WRAPPER_BYTES,
+        )
+        wrapper_dir = _get_wrapper_dir()
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        oversized = wrapper_dir / "bigtool"
+        oversized.write_text("hermes -p steve\n" + "x" * (_MAX_WRAPPER_BYTES + 1))
+        assert find_alias_for_profile("steve") is None
+
     def test_custom_alias_on_windows(self, profile_env, monkeypatch):
         monkeypatch.setattr("sys.platform", "win32")
         from hermes_cli.profiles import create_wrapper_script, find_alias_for_profile

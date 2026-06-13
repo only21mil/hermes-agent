@@ -275,6 +275,16 @@ def _get_wrapper_dir() -> Path:
     return Path.home() / ".local" / "bin"
 
 
+# A wrapper script created by create_wrapper_script() is a couple of lines
+# (~40 bytes). The wrapper dir (~/.local/bin) also holds large unrelated,
+# suffix-less binaries (swiftlint, qdrant, uv, …). find_alias_for_profile()
+# must not read those fully into memory and UTF-8-decode them: it runs once
+# per profile, so on a host with many profiles + big tools it burns minutes of
+# CPU on the event loop and wedges the dashboard backend. Anything bigger than
+# this cap cannot be one of our wrappers, so skip it before reading.
+_MAX_WRAPPER_BYTES = 64 * 1024
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -482,6 +492,14 @@ def find_alias_for_profile(profile_name: str) -> Optional[str]:
         if is_windows and entry.suffix != ".bat":
             continue
         if not is_windows and entry.suffix:
+            continue
+        # Skip files too large to be one of our wrappers before reading them —
+        # otherwise a big binary in ~/.local/bin gets fully read + decoded on
+        # every call (see _MAX_WRAPPER_BYTES).
+        try:
+            if entry.stat().st_size > _MAX_WRAPPER_BYTES:
+                continue
+        except OSError:
             continue
         try:
             content = entry.read_text()
