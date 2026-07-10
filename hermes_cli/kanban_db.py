@@ -1263,6 +1263,25 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Idempotent ledger for event-driven completion follow-up. One row per
+-- completed task_events.id lets gateway watchers claim each completion at
+-- most once without relying on outbound chat notification subscriptions.
+CREATE TABLE IF NOT EXISTS kanban_completion_followups (
+    event_id      INTEGER PRIMARY KEY,
+    task_id       TEXT NOT NULL,
+    run_id        INTEGER,
+    event_kind    TEXT NOT NULL DEFAULT 'completed',
+    task_assignee TEXT,
+    status        TEXT NOT NULL,
+    claimed_by    TEXT,
+    claimed_at    INTEGER NOT NULL,
+    completed_at  INTEGER,
+    failed_at     INTEGER,
+    error         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1273,6 +1292,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_completion_followups_status ON kanban_completion_followups(status, updated_at);
 """
 
 
@@ -2026,6 +2046,40 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_completion_followups (
+            event_id      INTEGER PRIMARY KEY,
+            task_id       TEXT NOT NULL,
+            run_id        INTEGER,
+            event_kind    TEXT NOT NULL DEFAULT 'completed',
+            task_assignee TEXT,
+            status        TEXT NOT NULL,
+            claimed_by    TEXT,
+            claimed_at    INTEGER NOT NULL,
+            completed_at  INTEGER,
+            failed_at     INTEGER,
+            error         TEXT,
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_completion_followups_status "
+        "ON kanban_completion_followups(status, updated_at)"
+    )
+    follow_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(kanban_completion_followups)")
+    }
+    if "event_kind" not in follow_cols:
+        _add_column_if_missing(
+            conn,
+            "kanban_completion_followups",
+            "event_kind",
+            "event_kind TEXT NOT NULL DEFAULT 'completed'",
+        )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -8254,6 +8308,277 @@ def task_age(task: Task) -> dict:
         "started_age_seconds": age_since_started,
         "time_to_complete_seconds": time_to_complete,
     }
+
+
+# ---------------------------------------------------------------------------
+# Completion follow-up ledger (used by the gateway completion-followup watcher)
+# ---------------------------------------------------------------------------
+
+_COMPLETION_FOLLOWUP_REVIEW_PASS_RE = re.compile(r"(?i)\b(?:pass|passed|approved)\b")
+_COMPLETION_FOLLOWUP_REVIEW_REJECT_RE = re.compile(
+    r"(?i)\b(?:fail|failed|reject(?:ed)?|blocker|changes\s+requested)\b"
+)
+_REVIEW_REQUIRED_BODY_MARKER = "Review-required source:"
+
+
+def _is_review_required_reason(reason: Any) -> bool:
+    return str(reason or "").strip().lower().startswith("review-required:")
+
+
+def _reviewer_completion_indicates_pass(row: sqlite3.Row) -> bool:
+    parts: list[str] = []
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("summary"):
+        parts.append(str(payload.get("summary")))
+    for key in ("summary", "result", "metadata"):
+        try:
+            value = row[key]
+        except (KeyError, IndexError):
+            continue
+        if value:
+            parts.append(str(value))
+    text = "\n".join(parts)
+    if not text or _COMPLETION_FOLLOWUP_REVIEW_REJECT_RE.search(text):
+        return False
+    return bool(_COMPLETION_FOLLOWUP_REVIEW_PASS_RE.search(text))
+
+
+def _review_required_source_acceptance_skip_reason(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    source_completed_event_id: int,
+) -> Optional[str]:
+    block = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' AND id < ? "
+        "ORDER BY id DESC LIMIT 1",
+        (source_task_id, int(source_completed_event_id)),
+    ).fetchone()
+    if not block or not block["payload"]:
+        return None
+    try:
+        block_payload = json.loads(block["payload"] or "{}")
+    except Exception:
+        return None
+    reason = block_payload.get("reason") if isinstance(block_payload, dict) else None
+    if not _is_review_required_reason(reason):
+        return None
+    handoff_event_id = int(block["id"])
+    routed_rows = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_required_routed' "
+        "  AND id > ? AND id < ? "
+        "ORDER BY id DESC",
+        (source_task_id, handoff_event_id, int(source_completed_event_id)),
+    ).fetchall()
+    for routed in routed_rows:
+        try:
+            routed_payload = json.loads(routed["payload"] or "{}")
+        except Exception:
+            continue
+        if not isinstance(routed_payload, dict):
+            continue
+        if routed_payload.get("handoff_event_id") not in {None, handoff_event_id}:
+            continue
+        reviewer_task_id = str(routed_payload.get("reviewer_task_id") or "").strip()
+        if not reviewer_task_id:
+            continue
+        reviewer_task = conn.execute(
+            "SELECT created_by, body FROM tasks WHERE id = ?",
+            (reviewer_task_id,),
+        ).fetchone()
+        if not reviewer_task:
+            continue
+        if (
+            str(reviewer_task["created_by"] or "") != "review-required-router"
+            and _REVIEW_REQUIRED_BODY_MARKER not in str(reviewer_task["body"] or "")
+        ):
+            continue
+        reviewer_completed = conn.execute(
+            """
+            SELECT e.id, e.payload, r.summary, r.metadata, t.result
+              FROM task_events e
+              JOIN tasks t ON t.id = e.task_id
+              LEFT JOIN task_runs r ON r.id = e.run_id
+             WHERE e.task_id = ?
+               AND e.kind = 'completed'
+               AND e.id < ?
+             ORDER BY e.id DESC
+             LIMIT 1
+            """,
+            (reviewer_task_id, int(source_completed_event_id)),
+        ).fetchone()
+        if not reviewer_completed or not _reviewer_completion_indicates_pass(reviewer_completed):
+            continue
+        ledger = conn.execute(
+            "SELECT status FROM kanban_completion_followups "
+            "WHERE event_id = ? AND status = 'completed'",
+            (int(reviewer_completed["id"]),),
+        ).fetchone()
+        if ledger:
+            return "review_required_source_acceptance_after_reviewer_pass"
+    return None
+
+
+def claim_due_completion_followups(
+    conn: sqlite3.Connection,
+    *,
+    exclude_assignees: Optional[Iterable[str]] = None,
+    limit: int = 5,
+    claimed_by: Optional[str] = None,
+    min_event_created_at: Optional[int] = None,
+    min_event_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Atomically claim terminal task events that need Sats follow-up."""
+    try:
+        limit_i = max(1, int(limit or 1))
+    except (TypeError, ValueError):
+        limit_i = 5
+    excluded = {
+        str(item).strip().casefold()
+        for item in (exclude_assignees or [])
+        if str(item).strip()
+    }
+    try:
+        min_created_at = int(min_event_created_at) if min_event_created_at is not None else None
+    except (TypeError, ValueError):
+        min_created_at = None
+    try:
+        min_id = int(min_event_id) if min_event_id is not None else None
+    except (TypeError, ValueError):
+        min_id = None
+    now = int(time.time())
+    claimant = str(claimed_by or "gateway").strip() or "gateway"
+    claimed: list[dict[str, Any]] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT e.id AS event_id,
+                   e.task_id,
+                   e.run_id,
+                   e.kind AS event_kind,
+                   e.payload,
+                   e.created_at AS event_created_at,
+                   t.title,
+                   t.assignee,
+                   t.result,
+                   t.status
+              FROM task_events e
+              JOIN tasks t ON t.id = e.task_id
+              LEFT JOIN kanban_completion_followups f ON f.event_id = e.id
+             WHERE e.kind IN ('blocked', 'completed')
+               AND f.event_id IS NULL
+               AND (? IS NULL OR e.created_at >= ?)
+               AND (? IS NULL OR e.id > ?)
+             ORDER BY e.id ASC
+             LIMIT ?
+            """,
+            (min_created_at, min_created_at, min_id, min_id, limit_i),
+        ).fetchall()
+        for row in rows:
+            assignee = str(row["assignee"] or "").strip()
+            event_kind = str(row["event_kind"] or "")
+            skip_reason = None
+            if assignee and assignee.casefold() in excluded:
+                skip_reason = "excluded_assignee"
+            elif event_kind == "completed":
+                skip_reason = _review_required_source_acceptance_skip_reason(
+                    conn,
+                    source_task_id=str(row["task_id"]),
+                    source_completed_event_id=int(row["event_id"]),
+                )
+            status = "skipped" if skip_reason else "claimed"
+            event_id = int(row["event_id"])
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO kanban_completion_followups (
+                    event_id, task_id, run_id, event_kind, task_assignee,
+                    status, claimed_by, claimed_at, error,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    row["task_id"],
+                    row["run_id"],
+                    event_kind,
+                    assignee or None,
+                    status,
+                    claimant,
+                    now,
+                    skip_reason,
+                    now,
+                    now,
+                ),
+            )
+            if cur.rowcount != 1 or status != "claimed":
+                continue
+            try:
+                payload = json.loads(row["payload"]) if row["payload"] else None
+            except Exception:
+                payload = None
+            claimed.append({
+                "event_id": event_id,
+                "event_kind": event_kind,
+                "task_id": row["task_id"],
+                "run_id": int(row["run_id"]) if row["run_id"] is not None else None,
+                "payload": payload,
+                "event_created_at": int(row["event_created_at"]),
+                "title": row["title"],
+                "assignee": assignee or None,
+                "result": row["result"],
+                "status": row["status"],
+            })
+    return claimed
+
+
+def mark_completion_followup(
+    conn: sqlite3.Connection,
+    event_id: int,
+    *,
+    status: str,
+    error: Optional[str] = None,
+) -> bool:
+    """Mark a claimed completion follow-up as ``completed`` or ``failed``."""
+    normalized = str(status or "").strip().lower()
+    if normalized not in {"completed", "failed"}:
+        raise ValueError("completion follow-up status must be 'completed' or 'failed'")
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_completion_followups
+               SET status = ?,
+                   completed_at = ?,
+                   failed_at = ?,
+                   error = ?,
+                   updated_at = ?
+             WHERE event_id = ?
+               AND status = 'claimed'
+            """,
+            (
+                normalized,
+                now if normalized == "completed" else None,
+                now if normalized == "failed" else None,
+                None if error is None else str(error)[:1000],
+                now,
+                int(event_id),
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def get_completion_followup(conn: sqlite3.Connection, event_id: int) -> Optional[dict[str, Any]]:
+    """Return one completion-followup ledger row for tests/diagnostics."""
+    row = conn.execute(
+        "SELECT * FROM kanban_completion_followups WHERE event_id = ?",
+        (int(event_id),),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------

@@ -7346,6 +7346,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so human-in-the-loop workflows hear back without polling.
         asyncio.create_task(self._kanban_notifier_watcher())
 
+        # Start event-driven Sats/orchestrator completion follow-up. This is
+        # deliberately separate from native notifier subscriptions: subscriptions
+        # are outbound alerts, completion_followup is an internal gateway turn
+        # claimed from a durable ledger.
+        asyncio.create_task(self._kanban_completion_followup_watcher())
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -11693,8 +11699,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             # Prepend reasoning/thinking if display is enabled (per-platform).
-            # Mattermost requires explicit per-platform opt-in because this is
-            # scratch text, not ordinary final-answer content.
+            # Mattermost and Telegram require explicit per-platform opt-in
+            # because this is scratch text, not ordinary final-answer content.
+            # Telegram in particular is used by Kanban wake/report-out turns;
+            # a global CLI/WebUI display.show_reasoning=true must not leak
+            # reasoning into those final chat responses by default.
             try:
                 _show_reasoning_effective = _resolve_gateway_display_bool(
                     _load_gateway_config(),
@@ -11702,12 +11711,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "show_reasoning",
                     default=bool(getattr(self, "_show_reasoning", False)),
                     platform=source.platform,
-                    require_platform_override_for={Platform.MATTERMOST},
+                    require_platform_override_for={Platform.MATTERMOST, Platform.TELEGRAM},
                 )
             except Exception:
                 _show_reasoning_effective = (
                     False
-                    if source.platform == Platform.MATTERMOST
+                    if source.platform in {Platform.MATTERMOST, Platform.TELEGRAM}
                     else getattr(self, "_show_reasoning", False)
                 )
             if _show_reasoning_effective and response and not _intentional_silence:

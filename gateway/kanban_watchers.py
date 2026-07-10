@@ -112,6 +112,279 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    async def _kanban_completion_followup_watcher(self, interval: float = 5.0) -> None:
+        """Claim completed Kanban events and wake Sats via an internal turn.
+
+        This watcher is independent from ``kanban_notify_subs``: subscriptions
+        are outbound alerts, while completion follow-up is a durable exactly-once
+        orchestrator continuation hook.
+        """
+        try:
+            from gateway.config import Platform as _Platform
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.session import SessionSource
+            from hermes_cli import kanban_db as _kb
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("kanban completion follow-up: imports unavailable; disabled")
+            return
+
+        def _cfg_bool(value: Any, default: bool = False) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, str):
+                return value.strip().lower() not in {"0", "false", "no", "off"}
+            return bool(value)
+
+        def _cfg_list(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                return [p.strip() for p in value.split(",") if p.strip()]
+            if isinstance(value, (list, tuple, set)):
+                return [str(p).strip() for p in value if str(p).strip()]
+            return []
+
+        try:
+            cfg = _load_config()
+        except Exception as exc:
+            logger.warning("kanban completion follow-up: cannot load config (%s); disabled", exc)
+            return
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        follow_cfg = kanban_cfg.get("completion_followup") or {}
+        if not isinstance(follow_cfg, dict):
+            logger.warning(
+                "kanban completion follow-up: invalid kanban.completion_followup=%r; disabled",
+                follow_cfg,
+            )
+            return
+        env_override = os.environ.get("HERMES_COMPLETION_FOLLOWUP_ENABLED", "").strip().lower()
+        if env_override not in {"1", "true", "yes", "on"} and not _cfg_bool(follow_cfg.get("enabled"), False):
+            logger.info("kanban completion follow-up: disabled via config")
+            return
+
+        active_profile = self._active_profile_name()
+        target_profile = str(follow_cfg.get("target_profile") or "sats").strip() or "sats"
+        if target_profile not in {"*", active_profile}:
+            logger.warning(
+                "kanban completion follow-up: target_profile=%s does not match active profile=%s; disabled",
+                target_profile,
+                active_profile,
+            )
+            return
+
+        excluded = _cfg_list(follow_cfg.get("exclude_assignees"))
+        for implied in ("sats", target_profile if target_profile != "*" else ""):
+            if implied and implied.casefold() not in {item.casefold() for item in excluded}:
+                excluded.append(implied)
+        try:
+            max_per_tick = max(1, int(follow_cfg.get("max_per_tick", 5) or 5))
+        except (TypeError, ValueError):
+            max_per_tick = 5
+        since_created_at = os.environ.get("HERMES_COMPLETION_FOLLOWUP_SINCE_CREATED_AT", "").strip() or follow_cfg.get("since_created_at")
+        try:
+            min_event_created_at = int(since_created_at) if since_created_at not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban completion follow-up: invalid since_created_at=%r; no cutoff applied",
+                since_created_at,
+            )
+            min_event_created_at = None
+        backfill_existing = _cfg_bool(follow_cfg.get("backfill_existing"), False)
+        startup_min_event_ids: dict[str, int] = {}
+
+        platform_name = str(follow_cfg.get("platform") or "").strip().lower()
+
+        def _destination() -> tuple[Any, Any, Any] | None:
+            candidates: list[Any] = []
+            if platform_name:
+                try:
+                    candidates.append(_Platform(platform_name))
+                except ValueError:
+                    logger.warning("kanban completion follow-up: unknown platform %r; disabled", platform_name)
+                    return None
+            else:
+                candidates.extend(list(getattr(self, "adapters", {}).keys()))
+            for platform in candidates:
+                adapter = getattr(self, "adapters", {}).get(platform)
+                if adapter is None:
+                    continue
+                home = self.config.get_home_channel(platform) if getattr(self, "config", None) else None
+                if home and getattr(home, "chat_id", None):
+                    return platform, adapter, home
+            logger.warning("kanban completion follow-up: no active adapter/home channel; disabled")
+            return None
+
+        dest = _destination()
+        if dest is None:
+            return
+        platform, adapter, home = dest
+        logger.info(
+            "kanban completion follow-up: enabled profile=%s max_per_tick=%d since_created_at=%s",
+            active_profile,
+            max_per_tick,
+            min_event_created_at if min_event_created_at is not None else "none",
+        )
+
+        def _build_prompt(item: dict[str, Any], board_slug: str) -> str:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if not summary:
+                summary = item.get("result") or ""
+            summary = " ".join(str(summary or "").split())[:500]
+            parts = [
+                "[IMPORTANT: Kanban worker completion follow-up]",
+                f"Board: {board_slug}",
+                f"Task: {item.get('task_id')}",
+                f"Title: {item.get('title') or ''}",
+                f"Assignee: {item.get('assignee') or ''}",
+                f"Event: {item.get('event_kind') or 'completed'}",
+            ]
+            if item.get("run_id") is not None:
+                parts.append(f"Run: {item.get('run_id')}")
+            if summary:
+                parts.append(f"Summary: {summary}")
+            parts.append(
+                "This is an internal event-driven wake-up from Hermes Kanban, not a human message. "
+                "Inspect the completed worker card/handoff, decide whether to accept/report out or request review, "
+                "and report the outcome in the current Sats style."
+            )
+            return "\n".join(parts)
+
+        async def _dispatch_one(item: dict[str, Any], board_slug: str) -> None:
+            event_id = int(item["event_id"])
+            thread_id = str(getattr(home, "thread_id", "") or "").strip() or None
+            event = MessageEvent(
+                text=_build_prompt(item, board_slug),
+                message_type=MessageType.TEXT,
+                source=SessionSource(
+                    platform=platform,
+                    chat_id=str(home.chat_id),
+                    chat_name=getattr(home, "name", None),
+                    chat_type="thread" if thread_id else "dm",
+                    user_id="system:kanban-completion-followup",
+                    user_name="Kanban Completion Follow-up",
+                    thread_id=thread_id,
+                ),
+                internal=True,
+            )
+            try:
+                accepted = await adapter.handle_message(event)
+                if accepted is not True:
+                    raise RuntimeError("adapter rejected internal completion follow-up")
+            except Exception as exc:
+                err = str(exc)
+                await asyncio.to_thread(_mark_followup, board_slug, event_id, "failed", err)
+                logger.warning(
+                    "kanban completion follow-up: failed to schedule event %s task %s on board %s: %s",
+                    event_id,
+                    item.get("task_id"),
+                    board_slug,
+                    err,
+                )
+                return
+            await asyncio.to_thread(_mark_followup, board_slug, event_id, "completed", None)
+            logger.info(
+                "kanban completion follow-up: scheduled event %s task %s on board %s",
+                event_id,
+                item.get("task_id"),
+                board_slug,
+            )
+
+        def _mark_followup(board_slug: str, event_id: int, status: str, error: str | None) -> None:
+            conn = _kb.connect(board=board_slug)
+            try:
+                _kb.mark_completion_followup(conn, event_id, status=status, error=error)
+            finally:
+                conn.close()
+
+        def _claim_due() -> list[tuple[str, dict[str, Any]]]:
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            out: list[tuple[str, dict[str, Any]]] = []
+            seen_db_paths: set[str] = set()
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
+                except Exception:
+                    resolved_db_path = f"slug:{slug}"
+                if resolved_db_path in seen_db_paths:
+                    continue
+                seen_db_paths.add(resolved_db_path)
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    due = _kb.claim_due_completion_followups(
+                        conn,
+                        exclude_assignees=excluded,
+                        limit=max(1, max_per_tick - len(out)),
+                        claimed_by=active_profile,
+                        min_event_created_at=min_event_created_at,
+                        min_event_id=startup_min_event_ids.get(slug),
+                    )
+                    out.extend((slug, item) for item in due)
+                    if len(out) >= max_per_tick:
+                        break
+                except Exception:
+                    logger.exception("kanban completion follow-up: claim failed on board %s", slug)
+                finally:
+                    if conn is not None:
+                        conn.close()
+            return out
+
+        def _capture_startup_min_event_ids() -> dict[str, int]:
+            if backfill_existing or min_event_created_at is not None:
+                return {}
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            baselines: dict[str, int] = {}
+            seen_db_paths: set[str] = set()
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
+                except Exception:
+                    resolved_db_path = f"slug:{slug}"
+                if resolved_db_path in seen_db_paths:
+                    continue
+                seen_db_paths.add(resolved_db_path)
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    baselines[slug] = int(
+                        conn.execute("SELECT coalesce(max(id), 0) FROM task_events").fetchone()[0] or 0
+                    )
+                except Exception:
+                    logger.exception("kanban completion follow-up: baseline failed on board %s", slug)
+                finally:
+                    if conn is not None:
+                        conn.close()
+            return baselines
+
+        startup_min_event_ids = await asyncio.to_thread(_capture_startup_min_event_ids)
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                due = await asyncio.to_thread(_claim_due)
+                for board_slug, item in due:
+                    await _dispatch_one(item, board_slug)
+            except asyncio.CancelledError:
+                logger.debug("kanban completion follow-up: cancelled")
+                raise
+            except Exception:
+                logger.exception("kanban completion follow-up: unexpected watcher error")
+            slept = 0.0
+            while slept < interval and self._running:
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 

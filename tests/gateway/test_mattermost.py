@@ -113,6 +113,51 @@ class TestMattermostDisplayHygiene:
             require_platform_override_for={Platform.MATTERMOST},
         ) is True
 
+    def test_telegram_requires_platform_opt_in_for_show_reasoning(self):
+        """Global show_reasoning must not prepend scratch reasoning in Telegram."""
+        user_config = {"display": {"show_reasoning": True}}
+
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "telegram",
+            "show_reasoning",
+            default=False,
+            platform=Platform.TELEGRAM,
+            require_platform_override_for={Platform.MATTERMOST, Platform.TELEGRAM},
+        ) is False
+
+    def test_telegram_platform_opt_in_can_enable_show_reasoning(self):
+        """Telegram can still opt into visible reasoning explicitly."""
+        user_config = {
+            "display": {
+                "show_reasoning": False,
+                "platforms": {"telegram": {"show_reasoning": True}},
+            }
+        }
+
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "telegram",
+            "show_reasoning",
+            default=False,
+            platform=Platform.TELEGRAM,
+            require_platform_override_for={Platform.MATTERMOST, Platform.TELEGRAM},
+        ) is True
+
+    def test_global_show_reasoning_still_applies_to_other_platforms(self):
+        """The opt-in guard must preserve non-Telegram/Mattermost behavior."""
+        user_config = {"display": {"show_reasoning": True}}
+
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "discord",
+            "show_reasoning",
+            default=False,
+            platform=Platform.DISCORD,
+            require_platform_override_for={Platform.MATTERMOST, Platform.TELEGRAM},
+        ) is True
+
+
     def test_global_thinking_progress_still_applies_to_other_platforms(self):
         """The Mattermost guard must not silently neuter Telegram/other chats."""
         user_config = {"display": {"thinking_progress": True}}
