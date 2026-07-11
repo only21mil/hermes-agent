@@ -324,10 +324,10 @@ def test_completion_followup_adapter_rejection_marks_failed_not_completed(tmp_pa
     assert row["error"] == "adapter rejected internal completion follow-up"
 
 
-def test_completion_followup_none_adapter_return_marks_failed_not_completed(tmp_path, monkeypatch):
+def test_completion_followup_none_adapter_return_marks_completed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "none-return.db"))
     kb.init_db()
-    _tid, event_id = _complete_task(summary="none return should fail ledger")
+    _tid, event_id = _complete_task(summary="none return should still mean accepted")
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda *a, **k: {
@@ -348,10 +348,40 @@ def test_completion_followup_none_adapter_return_marks_failed_not_completed(tmp_
 
     row = _followup_row(event_id)
     assert row is not None
-    assert row["status"] == "failed"
-    assert row["completed_at"] is None
-    assert row["failed_at"] is not None
-    assert row["error"] == "adapter rejected internal completion follow-up"
+    assert row["status"] == "completed"
+    assert row["completed_at"] is not None
+    assert row["failed_at"] is None
+    assert row["error"] is None
+
+
+def test_completion_followup_failed_row_retries_after_backoff(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "retry.db"))
+    kb.init_db()
+    _tid, event_id = _complete_task(summary="retry me")
+
+    conn = kb.connect()
+    try:
+        due = kb.claim_due_completion_followups(conn, exclude_assignees=["sats"], limit=10, claimed_by="sats")
+        assert [item["event_id"] for item in due] == [event_id]
+        assert kb.mark_completion_followup(conn, event_id, status="failed", error="transient", retry_base_seconds=1)
+        row = kb.get_completion_followup(conn, event_id)
+        assert row is not None
+        assert row["status"] == "failed"
+        assert row["retry_count"] == 1
+        assert row["next_attempt_at"] is not None
+        assert kb.claim_due_completion_followups(conn, exclude_assignees=["sats"], limit=10, claimed_by="sats") == []
+        conn.execute(
+            "UPDATE kanban_completion_followups SET next_attempt_at = 0 WHERE event_id = ?",
+            (event_id,),
+        )
+        due = kb.claim_due_completion_followups(conn, exclude_assignees=["sats"], limit=10, claimed_by="sats")
+        assert [item["event_id"] for item in due] == [event_id]
+        row = kb.get_completion_followup(conn, event_id)
+        assert row is not None
+        assert row["status"] == "claimed"
+        assert row["retry_count"] == 1
+    finally:
+        conn.close()
 
 
 def test_completion_followup_default_live_only_skips_existing_backlog(tmp_path, monkeypatch):

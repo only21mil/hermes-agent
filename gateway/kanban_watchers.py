@@ -181,6 +181,22 @@ class GatewayKanbanWatchersMixin:
             max_per_tick = max(1, int(follow_cfg.get("max_per_tick", 5) or 5))
         except (TypeError, ValueError):
             max_per_tick = 5
+        try:
+            max_retries_raw = follow_cfg.get("max_retries", 3)
+            max_retries = max(0, int(3 if max_retries_raw is None else max_retries_raw))
+        except (TypeError, ValueError):
+            max_retries = 3
+        try:
+            retry_base_seconds = max(1, int(follow_cfg.get("retry_base_seconds", 60) or 60))
+        except (TypeError, ValueError):
+            retry_base_seconds = 60
+        try:
+            retry_max_seconds = max(
+                retry_base_seconds,
+                int(follow_cfg.get("retry_max_seconds", 3600) or 3600),
+            )
+        except (TypeError, ValueError):
+            retry_max_seconds = 3600
         since_created_at = os.environ.get("HERMES_COMPLETION_FOLLOWUP_SINCE_CREATED_AT", "").strip() or follow_cfg.get("since_created_at")
         try:
             min_event_created_at = int(since_created_at) if since_created_at not in (None, "") else None
@@ -270,7 +286,12 @@ class GatewayKanbanWatchersMixin:
             )
             try:
                 accepted = await adapter.handle_message(event)
-                if accepted is not True:
+                # BasePlatformAdapter.handle_message intentionally returns None
+                # after synchronously enqueueing/spawning the background agent
+                # turn. Older tests used True as a fake adapter acknowledgement,
+                # but live Telegram adapters return None on successful acceptance;
+                # treating None as rejection marked every durable wake as failed.
+                if accepted is False:
                     raise RuntimeError("adapter rejected internal completion follow-up")
             except Exception as exc:
                 err = str(exc)
@@ -294,7 +315,14 @@ class GatewayKanbanWatchersMixin:
         def _mark_followup(board_slug: str, event_id: int, status: str, error: str | None) -> None:
             conn = _kb.connect(board=board_slug)
             try:
-                _kb.mark_completion_followup(conn, event_id, status=status, error=error)
+                _kb.mark_completion_followup(
+                    conn,
+                    event_id,
+                    status=status,
+                    error=error,
+                    retry_base_seconds=retry_base_seconds,
+                    retry_max_seconds=retry_max_seconds,
+                )
             finally:
                 conn.close()
 
@@ -325,6 +353,7 @@ class GatewayKanbanWatchersMixin:
                         claimed_by=active_profile,
                         min_event_created_at=min_event_created_at,
                         min_event_id=startup_min_event_ids.get(slug),
+                        max_retries=max_retries,
                     )
                     out.extend((slug, item) for item in due)
                     if len(out) >= max_per_tick:

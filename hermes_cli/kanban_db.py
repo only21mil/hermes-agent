@@ -1277,6 +1277,8 @@ CREATE TABLE IF NOT EXISTS kanban_completion_followups (
     claimed_at    INTEGER NOT NULL,
     completed_at  INTEGER,
     failed_at     INTEGER,
+    retry_count   INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER,
     error         TEXT,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
@@ -2060,6 +2062,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             claimed_at    INTEGER NOT NULL,
             completed_at  INTEGER,
             failed_at     INTEGER,
+            retry_count   INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER,
             error         TEXT,
             created_at    INTEGER NOT NULL,
             updated_at    INTEGER NOT NULL
@@ -2079,6 +2083,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "kanban_completion_followups",
             "event_kind",
             "event_kind TEXT NOT NULL DEFAULT 'completed'",
+        )
+    if "retry_count" not in follow_cols:
+        _add_column_if_missing(
+            conn,
+            "kanban_completion_followups",
+            "retry_count",
+            "retry_count INTEGER NOT NULL DEFAULT 0",
+        )
+    if "next_attempt_at" not in follow_cols:
+        _add_column_if_missing(
+            conn,
+            "kanban_completion_followups",
+            "next_attempt_at",
+            "next_attempt_at INTEGER",
         )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -8432,8 +8450,16 @@ def claim_due_completion_followups(
     claimed_by: Optional[str] = None,
     min_event_created_at: Optional[int] = None,
     min_event_id: Optional[int] = None,
+    max_retries: int = 3,
 ) -> list[dict[str, Any]]:
-    """Atomically claim terminal task events that need Sats follow-up."""
+    """Atomically claim terminal task events that need Sats follow-up.
+
+    Fresh terminal events are inserted into the durable follow-up ledger.
+    Previously failed rows are retried after their ``next_attempt_at`` backoff
+    until ``max_retries`` is reached. A retry reclaims the same event id, so the
+    downstream Sats wake remains exactly-once successful per terminal event and
+    never depends on ``kanban_notify_subs`` being present.
+    """
     try:
         limit_i = max(1, int(limit or 1))
     except (TypeError, ValueError):
@@ -8451,9 +8477,32 @@ def claim_due_completion_followups(
         min_id = int(min_event_id) if min_event_id is not None else None
     except (TypeError, ValueError):
         min_id = None
+    try:
+        max_retries_i = max(0, int(max_retries))
+    except (TypeError, ValueError):
+        max_retries_i = 3
     now = int(time.time())
     claimant = str(claimed_by or "gateway").strip() or "gateway"
     claimed: list[dict[str, Any]] = []
+
+    def _append_claimed(row: sqlite3.Row, assignee: str) -> None:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except Exception:
+            payload = None
+        claimed.append({
+            "event_id": int(row["event_id"]),
+            "event_kind": str(row["event_kind"] or ""),
+            "task_id": row["task_id"],
+            "run_id": int(row["run_id"]) if row["run_id"] is not None else None,
+            "payload": payload,
+            "event_created_at": int(row["event_created_at"]),
+            "title": row["title"],
+            "assignee": assignee or None,
+            "result": row["result"],
+            "status": row["status"],
+        })
+
     with write_txn(conn):
         rows = conn.execute(
             """
@@ -8471,13 +8520,20 @@ def claim_due_completion_followups(
               JOIN tasks t ON t.id = e.task_id
               LEFT JOIN kanban_completion_followups f ON f.event_id = e.id
              WHERE e.kind IN ('blocked', 'completed')
-               AND f.event_id IS NULL
+               AND (
+                    f.event_id IS NULL
+                    OR (
+                        f.status = 'failed'
+                        AND coalesce(f.retry_count, 0) < ?
+                        AND coalesce(f.next_attempt_at, 0) <= ?
+                    )
+               )
                AND (? IS NULL OR e.created_at >= ?)
                AND (? IS NULL OR e.id > ?)
              ORDER BY e.id ASC
              LIMIT ?
             """,
-            (min_created_at, min_created_at, min_id, min_id, limit_i),
+            (max_retries_i, now, min_created_at, min_created_at, min_id, min_id, limit_i),
         ).fetchall()
         for row in rows:
             assignee = str(row["assignee"] or "").strip()
@@ -8516,23 +8572,25 @@ def claim_due_completion_followups(
                 ),
             )
             if cur.rowcount != 1 or status != "claimed":
-                continue
-            try:
-                payload = json.loads(row["payload"]) if row["payload"] else None
-            except Exception:
-                payload = None
-            claimed.append({
-                "event_id": event_id,
-                "event_kind": event_kind,
-                "task_id": row["task_id"],
-                "run_id": int(row["run_id"]) if row["run_id"] is not None else None,
-                "payload": payload,
-                "event_created_at": int(row["event_created_at"]),
-                "title": row["title"],
-                "assignee": assignee or None,
-                "result": row["result"],
-                "status": row["status"],
-            })
+                retry_cur = conn.execute(
+                    """
+                    UPDATE kanban_completion_followups
+                       SET status = 'claimed',
+                           claimed_by = ?,
+                           claimed_at = ?,
+                           failed_at = NULL,
+                           next_attempt_at = NULL,
+                           updated_at = ?
+                     WHERE event_id = ?
+                       AND status = 'failed'
+                       AND coalesce(retry_count, 0) < ?
+                       AND coalesce(next_attempt_at, 0) <= ?
+                    """,
+                    (claimant, now, now, event_id, max_retries_i, now),
+                )
+                if retry_cur.rowcount != 1:
+                    continue
+            _append_claimed(row, assignee)
     return claimed
 
 
@@ -8542,19 +8600,38 @@ def mark_completion_followup(
     *,
     status: str,
     error: Optional[str] = None,
+    retry_base_seconds: int = 60,
+    retry_max_seconds: int = 3600,
 ) -> bool:
     """Mark a claimed completion follow-up as ``completed`` or ``failed``."""
     normalized = str(status or "").strip().lower()
     if normalized not in {"completed", "failed"}:
         raise ValueError("completion follow-up status must be 'completed' or 'failed'")
     now = int(time.time())
+    try:
+        base = max(1, int(retry_base_seconds))
+    except (TypeError, ValueError):
+        base = 60
+    try:
+        max_delay = max(base, int(retry_max_seconds))
+    except (TypeError, ValueError):
+        max_delay = 3600
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT retry_count FROM kanban_completion_followups WHERE event_id = ? AND status = 'claimed'",
+            (int(event_id),),
+        ).fetchone()
+        retry_count = int(row["retry_count"] or 0) if row else 0
+        next_retry_count = retry_count + 1 if normalized == "failed" else retry_count
+        delay = min(max_delay, base * (2 ** max(0, retry_count))) if normalized == "failed" else None
         cur = conn.execute(
             """
             UPDATE kanban_completion_followups
                SET status = ?,
                    completed_at = ?,
                    failed_at = ?,
+                   retry_count = ?,
+                   next_attempt_at = ?,
                    error = ?,
                    updated_at = ?
              WHERE event_id = ?
@@ -8564,6 +8641,8 @@ def mark_completion_followup(
                 normalized,
                 now if normalized == "completed" else None,
                 now if normalized == "failed" else None,
+                next_retry_count,
+                now + delay if delay is not None else None,
                 None if error is None else str(error)[:1000],
                 now,
                 int(event_id),
